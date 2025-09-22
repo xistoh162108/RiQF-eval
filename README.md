@@ -228,7 +228,9 @@ If you use this framework in your research, please cite the following authors:
       - Development Intern, HyperX Inc.
       - Undergraduate Student, KAIST School of Computing
   - **Jongrye Jang**: cto@hyper-x.ai
+      - Chief Technology Officer (CTO), HyperX Inc.  
   - **Hanbin Ji**: ceo@hyper-x.ai
+      - Chief Executive Officer (CEO), HyperX Inc.
 
 ## License
 
