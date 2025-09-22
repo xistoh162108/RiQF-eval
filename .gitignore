@@ -1,0 +1,17 @@
+.env
+RiQF-Eval/results/*
+data/*
+__pycache__/
+*.pyc
+.vscode/
+.DS_Store
+.ipynb_checkpoints/
+.idea/
+logs/
+*.log
+*.sqlite3
+*.db
+*.pdf
+CLAUDE.md
+deepseek-vl/*
+mRAG-gim/*
