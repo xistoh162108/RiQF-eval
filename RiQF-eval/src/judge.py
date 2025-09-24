@@ -162,7 +162,7 @@ Your primary goal is to evaluate the answer from the perspective of a user who n
 RETRY_SETTINGS = retry(
     wait=wait_random_exponential(min=1, max=60),
     stop=stop_after_attempt(5),
-    retry=retry_if_exception_type((OpenAIRateLimitError, AnthropicRateLimitError))
+    retry=retry_if_exception_type((OpenAIRateLimitErro, AnthropicRateLimitError))
 )
 
 @RETRY_SETTINGS

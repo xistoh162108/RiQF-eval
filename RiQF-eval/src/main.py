@@ -9,13 +9,13 @@ import dataclasses
 import argparse
 import asyncio
 import pandas as pd
+import shutil
 
 # 각 모듈에서 비동기 버전의 함수들을 임포트합니다.
-from preprocess import process_page, PageContext
+from preprocess import batch_process_pages, PageContext 
 from query_gen import generate_questions_for_page
 from answer_gen import generate_answer
 from judge import judge_answer, run_heuristic_checks
-# import analysis # 필요 시 주석 해제
 
 # --------------------------------------------------------------------------
 # 로깅 설정
@@ -47,8 +47,24 @@ def convert_pdf_to_images(pdf_path: Path, output_folder: Path) -> List[Path]:
     return image_paths
 
 # --------------------------------------------------------------------------
-# 비동기 처리 워커 함수
+# 비동기 처리 워커 함수들
 # --------------------------------------------------------------------------
+
+# [신규] 질문 생성을 위한 비동기 워커 함수
+async def process_single_question_generation(
+    semaphore: asyncio.Semaphore,
+    context: PageContext
+) -> Dict:
+    """단일 페이지에 대한 질문 생성을 안정적으로 처리합니다."""
+    async with semaphore:
+        try:
+            questions = await generate_questions_for_page(context)
+            return {"status": "success", "context": context, "questions": questions}
+        except Exception as e:
+            logging.error(f"Question generation failed for page {context.page_id}: {e}", exc_info=False)
+            return {"status": "failure", "context": context, "error": str(e)}
+
+# 답변 생성 및 심사를 위한 비동기 워커 함수 (기존과 동일)
 async def process_single_evaluation(
     semaphore: asyncio.Semaphore,
     doc_id: str,
@@ -88,15 +104,10 @@ async def process_single_evaluation(
 # --------------------------------------------------------------------------
 # 메인 비동기 실행 함수
 # --------------------------------------------------------------------------
-# --------------------------------------------------------------------------
-# 메인 비동기 실행 함수 (수정된 버전)
-# --------------------------------------------------------------------------
 async def async_main(args):
     input_path = Path(args.input)
     output_dir = Path(args.output)
     output_dir.mkdir(parents=True, exist_ok=True)
-
-    main_semaphore = asyncio.Semaphore(args.concurrency)
 
     files_to_process: List[Path] = []
     supported_extensions = ['.pdf', '.png', '.jpg', '.jpeg']
@@ -117,13 +128,16 @@ async def async_main(args):
         doc_output_dir = output_dir / file_path.stem
         doc_output_dir.mkdir(parents=True, exist_ok=True)
         
-        page_image_paths = []
+        pages_dir = doc_output_dir / "pages"
+        pages_dir.mkdir(exist_ok=True, parents=True)
+
         if file_path.suffix.lower() == '.pdf':
-            page_image_paths = convert_pdf_to_images(file_path, doc_output_dir / "pages")
+            convert_pdf_to_images(file_path, pages_dir)
         else:
-            page_image_paths = [file_path]
+            shutil.copy(file_path, pages_dir / file_path.name)
         
-        all_contexts = [process_page(p, doc_output_dir, use_captioning=args.captioning) for p in page_image_paths]
+        logging.info(f"'{pages_dir.name}' 폴더의 모든 페이지에 대한 배치 전처리를 시작합니다.")
+        all_contexts = batch_process_pages(pages_dir, doc_output_dir, use_captioning=args.captioning)
         context_map = {ctx.page_id: ctx for ctx in all_contexts}
         
         if args.save_context:
@@ -133,39 +147,79 @@ async def async_main(args):
                 with open(context_dir / f"{context.page_id}.json", 'w', encoding='utf-8') as f:
                     json.dump(dataclasses.asdict(context), f, ensure_ascii=False, indent=4)
         
+        # [변경] 질문 생성 단계에 재시도 및 동시성/간격 제어 로직 적용
         if args.generate_questions:
-            logging.info(f"총 {len(all_contexts)}개 페이지에 대한 질문 생성을 동시에 시작합니다.")
-            question_gen_tasks = [generate_questions_for_page(ctx) for ctx in all_contexts]
-            pages_with_questions = await asyncio.gather(*question_gen_tasks, return_exceptions=True)
+            q_jobs_to_process = all_contexts
+            successful_q_results = []
+            max_attempts = 5
+
+            for attempt in range(max_attempts):
+                if not q_jobs_to_process:
+                    logging.info(f"모든 질문 생성이 성공하여 {attempt}차 시도 후 종료합니다.")
+                    break
+                
+                is_first_attempt = (attempt == 0)
+                concurrency = args.concurrency if is_first_attempt else max(1, args.concurrency - attempt)
+                interval = args.interval if is_first_attempt else args.interval * (attempt + 1)
+                semaphore = asyncio.Semaphore(concurrency)
+
+                log_prefix = f"--- 질문 생성 {attempt + 1}차 실행 시작"
+                if not is_first_attempt:
+                    log_prefix += f" ({len(q_jobs_to_process)}개 재시도)"
+                logging.info(log_prefix + f" (총 {len(q_jobs_to_process)}개, 동시성: {concurrency}, 간격: {interval}초) ---")
+                
+                if not is_first_attempt:
+                    sleep_duration = 15 * attempt
+                    logging.info(f"Rate Limit 초기화를 위해 {sleep_duration}초 대기합니다.")
+                    await asyncio.sleep(sleep_duration)
+
+                tasks_this_pass = []
+                for context_job in q_jobs_to_process:
+                    task = asyncio.create_task(process_single_question_generation(semaphore, context_job))
+                    tasks_this_pass.append(task)
+                    await asyncio.sleep(interval)
+                
+                results_this_pass = await asyncio.gather(*tasks_this_pass)
+
+                successful_this_pass = [res for res in results_this_pass if res['status'] == 'success']
+                failed_this_pass = [res for res in results_this_pass if res['status'] == 'failure']
+                
+                successful_q_results.extend(successful_this_pass)
+                
+                if failed_this_pass:
+                    logging.warning(f"질문 생성 {attempt + 1}차 시도 후 {len(failed_this_pass)}개 작업이 실패했습니다.")
+                    q_jobs_to_process = [failed['context'] for failed in failed_this_pass]
+                else:
+                    q_jobs_to_process = []
             
+            if q_jobs_to_process:
+                logging.error(f"최대 {max_attempts}차 시도 후에도 {len(q_jobs_to_process)}개의 질문 생성 작업이 최종 실패했습니다.")
+
             questions_dir = doc_output_dir / "generated_questions"
             questions_dir.mkdir(exist_ok=True)
-            for context, questions in zip(all_contexts, pages_with_questions):
-                if isinstance(questions, Exception):
-                    logging.error(f"질문 생성 실패 ({context.page_id}): {questions}")
-                    continue
+            for result in successful_q_results:
+                context = result['context']
+                questions = result['questions']
                 if questions:
                     q_path = questions_dir / f"{context.page_id}_questions.json"
                     with open(q_path, 'w', encoding='utf-8') as f:
                         json.dump(questions, f, ensure_ascii=False, indent=4)
             logging.info("모든 페이지의 질문 생성을 완료했습니다.")
 
-        # --- 3/4단계: 답변 생성 및 심사 (다단계 재시도 로직 적용) ---
         if args.generate_answers:
-            # 1. 실행할 모든 작업의 '정보'를 먼저 정의
             job_definitions = []
-            for context in all_contexts:
-                q_path = doc_output_dir / "generated_questions" / f"{context.page_id}_questions.json"
-                if not q_path.exists(): continue
-                with open(q_path, 'r', encoding='utf-8') as f:
-                    try:
-                        questions = json.load(f)
-                    except json.JSONDecodeError:
-                        questions = []
-                if not questions: continue
-                
-                for q in questions:
-                    for model in args.models:
+            for model in args.models:
+                for context in all_contexts:
+                    q_path = doc_output_dir / "generated_questions" / f"{context.page_id}_questions.json"
+                    if not q_path.exists(): continue
+                    
+                    with open(q_path, 'r', encoding='utf-8') as f:
+                        content = f.read()
+                        questions = json.loads(content) if content.strip() else []
+
+                    if not questions: continue
+                    
+                    for q in questions:
                         for combo in args.combos:
                             job_definitions.append({
                                 "doc_id": file_path.stem, "context": context, "question": q,
@@ -174,62 +228,53 @@ async def async_main(args):
             
             all_successful_jobs = []
             jobs_to_process = job_definitions
-            max_attempts = 5 # 최대 5차 시도
+            max_attempts = 5
 
             for attempt in range(max_attempts):
                 if not jobs_to_process:
-                    logging.info(f"모든 작업이 성공하여 {attempt + 1}차 시도 전에 종료합니다.")
+                    logging.info(f"모든 작업이 성공하여 {attempt}차 시도 후 종료합니다.")
                     break
 
-                # 시도 횟수에 따라 점진적으로 속도 감속
                 is_first_attempt = (attempt == 0)
                 concurrency = args.concurrency if is_first_attempt else max(1, args.concurrency - attempt*2)
                 interval = args.interval if is_first_attempt else args.interval * (attempt + 1)
                 semaphore = asyncio.Semaphore(concurrency)
                 
-                if is_first_attempt:
-                    logging.info(f"--- 1차 실행 시작 ---")
-                    logging.info(f"총 {len(jobs_to_process)}개 작업, 동시성: {concurrency}, 간격: {interval}초")
-                else:
-                    sleep_duration = 30 * attempt # 2차: 30초, 3차: 60초... 대기
-                    logging.warning(f"--- {attempt + 1}차 재시도 시작 ({len(jobs_to_process)}개 남음) ---")
-                    logging.info(f"동시성: {concurrency}, 간격: {interval}초. Rate Limit 초기화를 위해 {sleep_duration}초 대기합니다.")
+                log_prefix = f"--- 답변/심사 {attempt + 1}차 실행 시작"
+                if not is_first_attempt:
+                    log_prefix += f" ({len(jobs_to_process)}개 재시도)"
+                logging.info(log_prefix + f" (총 {len(jobs_to_process)}개, 동시성: {concurrency}, 간격: {interval}초) ---")
+
+                if not is_first_attempt:
+                    sleep_duration = 30 * attempt
+                    logging.info(f"Rate Limit 초기화를 위해 {sleep_duration}초 대기합니다.")
                     await asyncio.sleep(sleep_duration)
 
-                # 현재 시도할 작업(task) 목록 생성
                 tasks_this_pass = []
                 for job_info in jobs_to_process:
-                    task = process_single_evaluation(semaphore, **job_info)
+                    task = asyncio.create_task(process_single_evaluation(semaphore, **job_info))
                     tasks_this_pass.append(task)
                     await asyncio.sleep(interval)
                 
-                # 현재 시도 실행
                 results_this_pass = await asyncio.gather(*tasks_this_pass)
 
-                # 성공/실패 분류
                 successful_this_pass = [res for res in results_this_pass if "error" not in res]
                 failed_this_pass = [res for res in results_this_pass if "error" in res]
                 
                 all_successful_jobs.extend(successful_this_pass)
 
                 if failed_this_pass:
-                    logging.warning(f"{attempt + 1}차 시도 후 {len(failed_this_pass)}개의 작업이 실패했습니다.")
-                    # 다음 시도를 위해 실패한 작업들의 '정보'를 다시 구성
-                    jobs_to_process = []
-                    for failed_job in failed_this_pass:
-                        context = context_map.get(failed_job['page_id'])
-                        if context:
-                            jobs_to_process.append({
-                                "doc_id": failed_job['doc_id'], "context": context, "question": failed_job['question'],
-                                "model": failed_job['model'], "combo": failed_job['combo'], "judges_to_use": args.judges
-                            })
+                    logging.warning(f"답변/심사 {attempt + 1}차 시도 후 {len(failed_this_pass)}개의 작업이 실패했습니다.")
+                    jobs_to_process = [
+                        {**failed_job, 'context': context_map[failed_job['page_id']], 'judges_to_use': args.judges}
+                        for failed_job in failed_this_pass
+                    ]
                 else:
-                    jobs_to_process = [] # 모든 작업 성공
+                    jobs_to_process = []
 
-            if jobs_to_process: # 최대 시도 후에도 실패한 작업
-                logging.error(f"최대 {max_attempts}차 시도 후에도 {len(jobs_to_process)}개의 작업이 최종적으로 실패했습니다.")
+            if jobs_to_process:
+                logging.error(f"최대 {max_attempts}차 시도 후에도 {len(jobs_to_process)}개의 답변/심사 작업이 최종적으로 실패했습니다.")
 
-            # --- 최종 결과 저장 ---
             logging.info(f"총 {len(all_successful_jobs)}개의 성공적인 결과를 파일에 저장합니다.")
             eval_dir = doc_output_dir / "evaluation_results"
             eval_dir.mkdir(exist_ok=True)
@@ -246,23 +291,22 @@ async def async_main(args):
 # 스크립트 실행 지점
 # --------------------------------------------------------------------------
 if __name__ == '__main__':
-    # (argparse 설정은 이전과 동일)
     parser = argparse.ArgumentParser(description="문서 처리 및 평가 파이프라인을 실행합니다.")
     parser.add_argument("--input", type=str, default="data/", help="처리할 파일 또는 폴더의 경로.")
     parser.add_argument("--output", type=str, default="results/", help="결과물을 저장할 최상위 폴더 경로.")
     parser.add_argument("--concurrency", type=int, default=5, help="동시에 실행할 최대 작업 수.")
     parser.add_argument("--interval", type=float, default=1.5, help="각 작업 요청 사이의 최소 대기 시간 (초).")
-    parser.add_argument("--save_context", action="store_true")
-    parser.add_argument("--captioning", action="store_true")
-    parser.add_argument("--generate_questions", action="store_true")
-    parser.add_argument("--generate_answers", action="store_true")
-    parser.add_argument("--judge_answers", action="store_true")
-    parser.add_argument("--models", nargs='+', default=["gpt-4o"])
-    parser.add_argument("--combos", nargs='+', default=["M1", "M2", "M3", "M4", "M5", "M6", "M7"])
-    parser.add_argument("--judges", nargs='+', default=["gpt-4o", "gemini-1.5-pro", "claude-sonnet-4"])
-    parser.add_argument("--run_analysis", action="store_true")
+    parser.add_argument("--save_context", action="store_true", help="전처리된 context를 JSON 파일로 저장합니다.")
+    parser.add_argument("--captioning", action="store_true", help="이미지 캡셔닝을 활성화합니다.")
+    parser.add_argument("--generate_questions", action="store_true", help="질문 생성을 실행합니다.")
+    parser.add_argument("--generate_answers", action="store_true", help="답변 생성 및 심사를 실행합니다.")
+    parser.add_argument("--models", nargs='+', default=["gpt-4o"], help="답변 생성에 사용할 모델 목록.")
+    parser.add_argument("--combos", nargs='+', default=["M1", "M2", "M3", "M4", "M5", "M6", "M7"], help="사용할 컨텍스트 조합.")
+    parser.add_argument("--judges", nargs='+', default=["gpt-4o"], help="답변 심사에 사용할 모델 목록.")
+    parser.add_argument("--run_analysis", action="store_true", help="결과 분석을 실행합니다.")
     
     args = parser.parse_args()
+    
     asyncio.run(async_main(args))
 
     if args.run_analysis:
