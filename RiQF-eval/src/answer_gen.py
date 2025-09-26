@@ -1,11 +1,10 @@
-# src/answer_gen.py
-
 import logging
 import os
 import base64
 from typing import List, Dict, Any, Callable, Tuple
 import gc  # 가비지 컬렉션 모듈
 import asyncio
+import json
 
 # --- API 클라이언트 및 관련 라이브러리 임포트 ---
 import google.generativeai as genai

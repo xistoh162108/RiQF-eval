@@ -81,23 +81,17 @@ def load_and_flatten_results(results_path: Path) -> pd.DataFrame:
 
 def calculate_ensemble_scores(df: pd.DataFrame) -> pd.DataFrame:
     """
-    각 답변에 대한 심사관들의 점수를 정규화하고 앙상블 점수를 계산합니다.
+    각 답변에 대한 심사관들의 점수를 평균내어 앙상블 점수를 계산합니다.
+    (편차가 거의 없을 때 Z-점수 정규화보다 안정적입니다.)
     """
     if df.empty or 'final_score' not in df.columns:
         return df
 
-    def robust_z_score(series):
-        median = series.median()
-        iqr = series.quantile(0.75) - series.quantile(0.25)
-        if iqr == 0:
-            return pd.Series(0, index=series.index)
-        return (series - median) / iqr
-
-    df['normalized_score'] = df.groupby('answer_id')['final_score'].transform(robust_z_score)
-    ensemble_scores = df.groupby('answer_id')['normalized_score'].mean().rename('ensemble_score')
+    # final_score의 평균을 바로 ensemble_score로 사용합니다.
+    ensemble_scores = df.groupby('answer_id')['final_score'].mean().rename('ensemble_score')
     df = df.merge(ensemble_scores, on='answer_id', how='left')
     
-    logging.info("앙상블 점수 계산이 완료되었습니다.")
+    logging.info("앙상블 점수(단순 평균) 계산이 완료되었습니다.")
     return df
 
 # ========================================================================
